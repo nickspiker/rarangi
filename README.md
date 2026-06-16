@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="rarangi.webp" alt="rārangi" width="400"/>
+</p>
+
 # rārangi
 
 **The register — durable, encrypted, queryable rows on a crash-proof vault.**
