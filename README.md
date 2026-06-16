@@ -35,13 +35,13 @@ use rarangi::{Db, Record, Value};
 
 let mut db = Db::open(storage)?;   // storage = a kete vault, or MemoryStore for tests
 
-db.put_row("track", "5vYA1mW9g2Coh1HUFUSmlb", &Record::new()
+db.put_row("track", "3am", &Record::new()
     .set("title",  "3AM")
     .set("artist", "Matchbox Twenty")
     .set("year",   1996u64)
     .set("added",  Value::Time(osc)))?;        // eagle-time
 
-let rec = db.get_row("track", "5vYA1mW9g2Coh1HUFUSmlb")?;   // Option<Record>
+let rec = db.get_row("track", "3am")?;   // Option<Record>
 rec.unwrap().text("title");                    // typed getters: text / uint / bytes / time
 db.list("track")?;                             // Vec<pk> — the catalog
 
