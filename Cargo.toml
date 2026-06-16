@@ -1,0 +1,14 @@
+[package]
+name = "rarangi"
+version = "0.0.0"
+edition = "2024"
+description = "rārangi (te reo Māori: list, row, register, index) — a query database on the manifestus keyed store: rows, a catalog, secondary indexes, and crash-safe transactions, with records encoded in VSF and encrypted via kete."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nickspiker/rarangi"
+
+[dependencies]
+# Record/index/catalog encoding. text-encode enables the Huffman/Unicode `x` string type (titles, lyrics in any language); ASCII-only `a` is always available.
+vsf = { path = "../vsf", features = ["text-encode"] }
+# Encrypted keyed storage over a manifestus vault (the durable backend).
+kete = { path = "../kete" }
+blake3 = "1.5"

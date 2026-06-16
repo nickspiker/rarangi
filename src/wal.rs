@@ -1,0 +1,299 @@
+//! The transaction spine.
+//!
+//! manifestus's only atomic durable unit is a single keyed `put`. So a multi-key transaction is staged in RAM, serialized into ONE complete VSF file holding the full post-images of every key it changes, and written with ONE `put("wal/{seq}")` — that put is the COMMIT POINT. Apply then blindly redoes those post-images (idempotent), writing the new superroot LAST. Recovery-on-open replays any live `wal/{seq}` and retires it; an absent WAL entry means the txn never committed.
+//!
+//! Single-writer: a new transaction must not be issued until the previous one's WAL entry is retired, so at most one committed-unapplied entry exists and recovery is a simple ascending replay.
+
+use vsf::{Tensor, VsfBuilder, VsfField, VsfHeader, VsfSection, VsfType};
+
+use crate::keys;
+use crate::store::{Store, StoreError};
+
+const FORMAT_VERSION: u8 = 0;
+
+#[derive(Debug)]
+pub enum DbError {
+    Store(String),
+    /// A stored record didn't decode as expected — corruption or a version skew.
+    Corrupt(String),
+}
+
+impl std::fmt::Display for DbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DbError::Store(s) => write!(f, "store: {s}"),
+            DbError::Corrupt(s) => write!(f, "corrupt: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for DbError {}
+
+impl From<StoreError> for DbError {
+    fn from(e: StoreError) -> Self {
+        DbError::Store(e.0)
+    }
+}
+
+pub type Result<T> = std::result::Result<T, DbError>;
+
+/// One post-image: write a value, or delete the key (`None`).
+pub type Write = (String, Option<Vec<u8>>);
+
+/// The database handle. Owns the store and the last committed transaction seq.
+pub struct Db<S: Store> {
+    store: S,
+    committed_seq: u64,
+}
+
+impl<S: Store> Db<S> {
+    /// Open (or initialize) the DB on `store`, running recovery first.
+    pub fn open(store: S) -> Result<Self> {
+        let committed_seq = match store.get(&keys::superroot())? {
+            Some(bytes) => decode_superroot(&bytes)?,
+            None => {
+                // Fresh DB: establish a superroot at seq 0 so recovery has an anchor.
+                store.put(&keys::superroot(), &encode_superroot(0))?;
+                0
+            }
+        };
+        let mut db = Db { store, committed_seq };
+        db.recover()?;
+        Ok(db)
+    }
+
+    /// Replay any committed-but-unretired WAL entries (ascending) and retire them. Idempotent: re-putting a key already at its target value is harmless.
+    fn recover(&mut self) -> Result<()> {
+        loop {
+            let seq = self.committed_seq + 1;
+            let Some(bytes) = self.store.get(&keys::wal(seq))? else {
+                break; // no live WAL entry beyond the committed seq → done
+            };
+            let rec = decode_wal(&bytes)?;
+            self.apply(seq, &rec)?;
+        }
+        Ok(())
+    }
+
+    /// Read a value by logical key (the committed state — readers never see a half-applied transaction because the superroot flips last).
+    pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.store.get(key)?)
+    }
+
+    /// Direct store access for content-addressed blobs (immutable, so they're written outside the WAL — see db.rs::put_blob).
+    pub(crate) fn store(&self) -> &S {
+        &self.store
+    }
+
+    /// Commit a set of post-images as one atomic logical transaction.
+    pub fn transact(&mut self, writes: Vec<Write>) -> Result<()> {
+        let seq = self.committed_seq + 1;
+        let new_superroot = encode_superroot(seq);
+        let rec = WalRecord { writes, superroot: new_superroot };
+
+        // COMMIT POINT: one atomic durable put. Before this, nothing happened.
+        self.store.put(&keys::wal(seq), &encode_wal(seq, &rec))?;
+        self.apply(seq, &rec)?;
+        Ok(())
+    }
+
+    /// Apply a committed WAL record: user post-images first, superroot LAST, then retire the WAL entry. Safe to call twice (idempotent redo).
+    fn apply(&mut self, seq: u64, rec: &WalRecord) -> Result<()> {
+        for (key, value) in &rec.writes {
+            match value {
+                Some(v) => self.store.put(key, v)?,
+                None => self.store.delete(key)?,
+            }
+        }
+        // The superroot flip is the visible "this transaction happened" edge.
+        self.store.put(&keys::superroot(), &rec.superroot)?;
+        self.committed_seq = seq;
+        self.store.delete(&keys::wal(seq))?;
+        Ok(())
+    }
+}
+
+// ============================================================================ Records ===================================================================
+
+struct WalRecord {
+    writes: Vec<Write>,
+    /// The new superroot bytes, applied last.
+    superroot: Vec<u8>,
+}
+
+/// Superroot: format version + last committed transaction seq. (Table registry, index roots, etc. join this in later phases.)
+fn encode_superroot(committed_seq: u64) -> Vec<u8> {
+    VsfBuilder::new()
+        .creation_time_oscillations(vsf::eagle_time_oscillations())
+        .add_section(
+            "superroot",
+            vec![
+                ("version".to_string(), VsfType::u3(FORMAT_VERSION)),
+                ("committed_seq".to_string(), VsfType::u6(committed_seq)),
+            ],
+        )
+        .build()
+        .expect("superroot encode")
+}
+
+fn decode_superroot(bytes: &[u8]) -> Result<u64> {
+    let (_, mut ptr) = VsfHeader::decode(bytes).map_err(DbError::Corrupt)?;
+    let sec = VsfSection::parse(bytes, &mut ptr).map_err(DbError::Corrupt)?;
+    match sec.get_field("committed_seq").and_then(|f| f.values.first()) {
+        Some(VsfType::u6(v)) => Ok(*v),
+        _ => Err(DbError::Corrupt("superroot missing committed_seq".into())),
+    }
+}
+
+/// WAL record: parallel `key`/`op`/`val` arrays for the user post-images, plus the new superroot bytes (applied last). A complete VSF file (envelope + provenance).
+fn encode_wal(seq: u64, rec: &WalRecord) -> Vec<u8> {
+    let mut keys_v = Vec::with_capacity(rec.writes.len());
+    let mut ops_v = Vec::with_capacity(rec.writes.len());
+    let mut vals_v = Vec::with_capacity(rec.writes.len());
+    for (key, value) in &rec.writes {
+        keys_v.push(VsfType::a(key.clone()));
+        match value {
+            Some(v) => {
+                ops_v.push(VsfType::u3(1));
+                vals_v.push(VsfType::t_u3(Tensor::new(vec![v.len()], v.clone())));
+            }
+            None => {
+                ops_v.push(VsfType::u3(0));
+                vals_v.push(VsfType::t_u3(Tensor::new(vec![0], Vec::new())));
+            }
+        }
+    }
+
+    let mut sec = VsfSection::new("wal");
+    sec.fields.push(VsfField {
+        name: "seq".to_string(),
+        values: vec![VsfType::u6(seq)],
+    });
+    sec.fields.push(VsfField { name: "key".to_string(), values: keys_v });
+    sec.fields.push(VsfField { name: "op".to_string(), values: ops_v });
+    sec.fields.push(VsfField { name: "val".to_string(), values: vals_v });
+    sec.fields.push(VsfField {
+        name: "superroot".to_string(),
+        values: vec![VsfType::t_u3(Tensor::new(vec![rec.superroot.len()], rec.superroot.clone()))],
+    });
+
+    VsfBuilder::new()
+        .creation_time_oscillations(vsf::eagle_time_oscillations())
+        .add_section_direct(sec)
+        .build()
+        .expect("wal encode")
+}
+
+fn decode_wal(bytes: &[u8]) -> Result<WalRecord> {
+    let (_, mut ptr) = VsfHeader::decode(bytes).map_err(DbError::Corrupt)?;
+    let sec = VsfSection::parse(bytes, &mut ptr).map_err(DbError::Corrupt)?;
+
+    let keys_v = field_values(&sec, "key")?;
+    let ops_v = field_values(&sec, "op")?;
+    let vals_v = field_values(&sec, "val")?;
+    if keys_v.len() != ops_v.len() || keys_v.len() != vals_v.len() {
+        return Err(DbError::Corrupt("wal key/op/val arrays misaligned".into()));
+    }
+
+    let mut writes = Vec::with_capacity(keys_v.len());
+    for i in 0..keys_v.len() {
+        let key = match &keys_v[i] {
+            VsfType::a(s) => s.clone(),
+            _ => return Err(DbError::Corrupt("wal key not ascii".into())),
+        };
+        let value = match (&ops_v[i], &vals_v[i]) {
+            (VsfType::u3(1), VsfType::t_u3(t)) => Some(t.data.clone()),
+            (VsfType::u3(0), _) => None,
+            _ => return Err(DbError::Corrupt("wal op/val type mismatch".into())),
+        };
+        writes.push((key, value));
+    }
+
+    let superroot = match sec.get_field("superroot").and_then(|f| f.values.first()) {
+        Some(VsfType::t_u3(t)) => t.data.clone(),
+        _ => return Err(DbError::Corrupt("wal missing superroot".into())),
+    };
+
+    Ok(WalRecord { writes, superroot })
+}
+
+fn field_values<'a>(sec: &'a VsfSection, name: &str) -> Result<&'a [VsfType]> {
+    sec.get_field(name)
+        .map(|f| f.values.as_slice())
+        .ok_or_else(|| DbError::Corrupt(format!("wal missing field {name}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::MemoryStore;
+
+    #[test]
+    fn commit_and_read_back() {
+        let mut db = Db::open(MemoryStore::new()).unwrap();
+        db.transact(vec![
+            ("row/t/a".to_string(), Some(b"alice".to_vec())),
+            ("row/t/b".to_string(), Some(b"bob".to_vec())),
+        ])
+        .unwrap();
+        assert_eq!(db.get("row/t/a").unwrap().as_deref(), Some(&b"alice"[..]));
+        assert_eq!(db.get("row/t/b").unwrap().as_deref(), Some(&b"bob"[..]));
+        assert_eq!(db.committed_seq, 1);
+        // WAL entry retired after apply.
+        assert!(db.store.get(&keys::wal(1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_post_image() {
+        let mut db = Db::open(MemoryStore::new()).unwrap();
+        db.transact(vec![("row/t/a".to_string(), Some(b"x".to_vec()))]).unwrap();
+        db.transact(vec![("row/t/a".to_string(), None)]).unwrap();
+        assert_eq!(db.get("row/t/a").unwrap(), None);
+        assert_eq!(db.committed_seq, 2);
+    }
+
+    #[test]
+    fn recovery_replays_committed_unapplied() {
+        // Simulate a crash AFTER the WAL commit point but BEFORE apply: the store holds an old superroot (seq 0) and a live wal/1, with the row NOT yet written. Opening must replay it.
+        let store = MemoryStore::new();
+        store.put(&keys::superroot(), &encode_superroot(0)).unwrap();
+        let rec = WalRecord {
+            writes: vec![("row/t/a".to_string(), Some(b"recovered".to_vec()))],
+            superroot: encode_superroot(1),
+        };
+        store.put(&keys::wal(1), &encode_wal(1, &rec)).unwrap();
+        // (row/t/a deliberately absent — apply never ran)
+
+        let db = Db::open(store).unwrap();
+        assert_eq!(db.committed_seq, 1);
+        assert_eq!(db.get("row/t/a").unwrap().as_deref(), Some(&b"recovered"[..]));
+        assert!(db.store.get(&keys::wal(1)).unwrap().is_none()); // retired
+    }
+
+    #[test]
+    fn recovery_is_idempotent_after_full_commit() {
+        // A fully-committed txn (WAL already retired) must not be re-applied or error.
+        let store = MemoryStore::new();
+        {
+            let mut db = Db::open(&store).unwrap();
+            db.transact(vec![("k".to_string(), Some(b"v".to_vec()))]).unwrap();
+        }
+        // Reopen on the same store — recovery finds no live WAL, committed_seq holds.
+        let db = Db::open(&store).unwrap();
+        assert_eq!(db.committed_seq, 1);
+        assert_eq!(db.get("k").unwrap().as_deref(), Some(&b"v"[..]));
+    }
+}
+
+// Allow `Db::open(&store)` in tests (and callers that keep the store) by implementing Store for shared references.
+impl<S: Store> Store for &S {
+    fn get(&self, key: &str) -> std::result::Result<Option<Vec<u8>>, StoreError> {
+        (**self).get(key)
+    }
+    fn put(&self, key: &str, value: &[u8]) -> std::result::Result<(), StoreError> {
+        (**self).put(key, value)
+    }
+    fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+        (**self).delete(key)
+    }
+}
