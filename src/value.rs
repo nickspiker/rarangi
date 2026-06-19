@@ -16,11 +16,11 @@ pub enum Value {
 }
 
 impl Value {
-    /// Encode to the matching self-describing VSF type.
+    /// Encode to the matching self-describing VSF type. Unsigned integers take the narrowest VSF width that holds the value (EWE) — `1996` is 2 bytes (`u4`), not 8 — so the caller passes one `u64` and storage stays minimal.
     pub fn to_vsf(&self) -> VsfType {
         match self {
             Value::Text(s) => VsfType::x(s.clone()),
-            Value::Uint(u) => VsfType::u6(*u),
+            Value::Uint(u) => uint_to_vsf(*u),
             Value::Bytes(b) => VsfType::t_u3(Tensor::new(vec![b.len()], b.clone())),
             Value::Time(t) => VsfType::e(EtType::e6(*t)),
         }
@@ -39,6 +39,19 @@ impl Value {
             VsfType::e(et) => Value::Time(eagle_oscillations(et)?),
             _ => return None,
         })
+    }
+}
+
+/// The narrowest VSF unsigned width that holds `u` (EWE): `u3` ≤ 255, `u4` ≤ 65535, `u5` ≤ 2³²-1, else `u6`.
+fn uint_to_vsf(u: u64) -> VsfType {
+    if u <= u8::MAX as u64 {
+        VsfType::u3(u as u8)
+    } else if u <= u16::MAX as u64 {
+        VsfType::u4(u as u16)
+    } else if u <= u32::MAX as u64 {
+        VsfType::u5(u as u32)
+    } else {
+        VsfType::u6(u)
     }
 }
 
@@ -69,5 +82,22 @@ impl From<u64> for Value {
 impl From<Vec<u8>> for Value {
     fn from(b: Vec<u8>) -> Self {
         Value::Bytes(b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uint_uses_minimal_ewe_width() {
+        assert!(matches!(uint_to_vsf(200), VsfType::u3(200)));
+        assert!(matches!(uint_to_vsf(1996), VsfType::u4(1996)));
+        assert!(matches!(uint_to_vsf(70_000), VsfType::u5(70_000)));
+        assert!(matches!(uint_to_vsf(5_000_000_000), VsfType::u6(5_000_000_000)));
+        // ...and every width decodes back to the same u64.
+        for n in [0u64, 200, 1996, 70_000, 5_000_000_000] {
+            assert_eq!(Value::from_vsf(&uint_to_vsf(n)), Some(Value::Uint(n)));
+        }
     }
 }

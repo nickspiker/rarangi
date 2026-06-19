@@ -528,7 +528,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "libc",
- "vsf 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "vsf 0.8.0",
 ]
 
 [[package]]
@@ -675,7 +675,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "kete",
- "vsf 0.8.0",
+ "vsf 0.8.1",
 ]
 
 [[package]]
@@ -892,22 +892,6 @@ dependencies = [
 [[package]]
 name = "vsf"
 version = "0.8.0"
-dependencies = [
- "bitvec",
- "blake3",
- "chrono",
- "hex",
- "i256",
- "libm",
- "num-complex",
- "num-traits",
- "spin",
- "unicode-normalization",
-]
-
-[[package]]
-name = "vsf"
-version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2c7481e6809ad0226db749bfb75818588fe205852f582fb8b84868aebd89170"
 dependencies = [
@@ -919,6 +903,22 @@ dependencies = [
  "libm",
  "num-complex",
  "num-traits",
+]
+
+[[package]]
+name = "vsf"
+version = "0.8.1"
+dependencies = [
+ "bitvec",
+ "blake3",
+ "chrono",
+ "hex",
+ "i256",
+ "libm",
+ "num-complex",
+ "num-traits",
+ "spin",
+ "unicode-normalization",
 ]
 
 [[package]]
