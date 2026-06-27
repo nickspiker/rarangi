@@ -14,12 +14,14 @@ mod blob;
 mod catalog;
 mod db;
 pub mod keys;
+pub mod pk;
 pub mod record;
 pub mod store;
 pub mod value;
 pub mod wal;
 
+pub use pk::Pk;
 pub use record::Record;
 pub use store::{MemoryStore, Store, StoreError};
 pub use value::Value;
-pub use wal::{Db, DbError, Write};
+pub use wal::{Db, DbError, Target, Write};

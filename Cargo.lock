@@ -478,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "kete"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -524,7 +524,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "manifestus"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "libc",
@@ -675,7 +675,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "kete",
- "vsf 0.8.1",
+ "vsf 0.8.2",
 ]
 
 [[package]]
@@ -844,12 +844,12 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tohu"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "base64",
  "blake3",
  "jni",
- "unicode-normalization",
+ "vsf 0.6.42",
 ]
 
 [[package]]
@@ -891,6 +891,23 @@ dependencies = [
 
 [[package]]
 name = "vsf"
+version = "0.6.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c5d0a40ee257e3d1c771570668208f2daa233eab0c91badf84d00132b0218bb"
+dependencies = [
+ "bitvec",
+ "blake3",
+ "chrono",
+ "hex",
+ "i256",
+ "libm",
+ "num-complex",
+ "num-traits",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "vsf"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2c7481e6809ad0226db749bfb75818588fe205852f582fb8b84868aebd89170"
@@ -907,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "vsf"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "bitvec",
  "blake3",
