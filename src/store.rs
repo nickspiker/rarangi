@@ -27,6 +27,19 @@ pub trait Store {
     fn get_addr(&self, addr: &[u8; 32]) -> Result<Option<Vec<u8>>, StoreError>;
     fn put_addr(&self, addr: &[u8; 32], value: &[u8]) -> Result<(), StoreError>;
     fn delete_addr(&self, addr: &[u8; 32]) -> Result<(), StoreError>;
+
+    /// Apply many put-or-delete ops IN ORDER. The default is the sequential per-op loop (semantics unchanged for plain stores); a backend with a group-commit primitive (kete) overrides it to land the whole list under ONE durable commit. The caller is the transaction's apply phase — [user post-images + superroot + WAL retire] riding one commit instead of one each is the 4-5x write-amplification cut behind the 2026-09-02 field day (40s message sends). Order is the contract: the superroot flip and the WAL retire only ever land after everything before them.
+    fn apply_batch(&self, ops: Vec<(crate::wal::Target, Option<Vec<u8>>)>) -> Result<(), StoreError> {
+        for (target, value) in ops {
+            match (target, value) {
+                (crate::wal::Target::Str(k), Some(v)) => self.put(&k, &v)?,
+                (crate::wal::Target::Str(k), None) => self.delete(&k)?,
+                (crate::wal::Target::Addr(a), Some(v)) => self.put_addr(&a, &v)?,
+                (crate::wal::Target::Addr(a), None) => self.delete_addr(&a)?,
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Store for kete::FlatStorage {
@@ -47,6 +60,20 @@ impl Store for kete::FlatStorage {
     }
     fn delete_addr(&self, addr: &[u8; 32]) -> Result<(), StoreError> {
         kete::FlatStorage::delete_addr(self, addr).map_err(|e| StoreError(e.to_string()))
+    }
+    /// The group-commit override: string keys derive to their vault addresses (the same derivation `write` uses, so batched and single writes hit identical rows), then the whole ordered list posts as ONE librarian batch — (usually) one manifestus commit for the entire transaction apply.
+    fn apply_batch(&self, ops: Vec<(crate::wal::Target, Option<Vec<u8>>)>) -> Result<(), StoreError> {
+        let items: Vec<([u8; 32], Option<Vec<u8>>)> = ops
+            .into_iter()
+            .map(|(target, value)| {
+                let addr = match target {
+                    crate::wal::Target::Str(s) => self.entry_addr(&s),
+                    crate::wal::Target::Addr(a) => a,
+                };
+                (addr, value)
+            })
+            .collect();
+        self.apply_addr_batch(items).map_err(|e| StoreError(e.to_string()))
     }
 }
 

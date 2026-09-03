@@ -121,20 +121,17 @@ impl<S: Store> Db<S> {
         Ok(())
     }
 
-    /// Apply a committed WAL record: user post-images first, superroot LAST, then retire the WAL entry. Safe to call twice (idempotent redo).
+    /// Apply a committed WAL record as ONE ordered batch: user post-images first, then the superroot flip, then the WAL retire — the exact order the sequential form wrote, but riding the store's group-commit (kete lands the lot under one manifestus commit instead of 4-5; the 2026-09-02 write-amplification fix). Order inside the batch is the store's contract — a fence-pressure prefix commit can land early ops sooner, never later ops first — so the superroot still only becomes visible after every post-image, and the retire only after the superroot. Safe to call twice (idempotent redo): the WAL entry this retires carries the full post-images, so a crash anywhere mid-batch replays the whole set.
     fn apply(&mut self, seq: u64, rec: &WalRecord) -> Result<()> {
+        let mut ops: Vec<(Target, Option<Vec<u8>>)> = Vec::with_capacity(rec.writes.len() + 2);
         for (target, value) in &rec.writes {
-            match (target, value) {
-                (Target::Str(k), Some(v)) => self.store.put(k, v)?,
-                (Target::Str(k), None) => self.store.delete(k)?,
-                (Target::Addr(a), Some(v)) => self.store.put_addr(a, v)?,
-                (Target::Addr(a), None) => self.store.delete_addr(a)?,
-            }
+            ops.push((target.clone(), value.clone()));
         }
         // The superroot flip is the visible "this transaction happened" edge.
-        self.store.put(&keys::superroot(), &rec.superroot)?;
+        ops.push((Target::Str(keys::superroot()), Some(rec.superroot.clone())));
+        ops.push((Target::Str(keys::wal(seq)), None));
+        self.store.apply_batch(ops)?;
         self.committed_seq = seq;
-        self.store.delete(&keys::wal(seq))?;
         Ok(())
     }
 }
@@ -351,5 +348,9 @@ impl<S: Store> Store for &S {
     }
     fn delete_addr(&self, addr: &[u8; 32]) -> std::result::Result<(), StoreError> {
         (**self).delete_addr(addr)
+    }
+    // Forward explicitly — the trait default on `&S` would re-dispatch thru the per-op methods and silently LOSE a backend's group-commit override.
+    fn apply_batch(&self, ops: Vec<(Target, Option<Vec<u8>>)>) -> std::result::Result<(), StoreError> {
+        (**self).apply_batch(ops)
     }
 }
