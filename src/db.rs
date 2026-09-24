@@ -64,6 +64,37 @@ impl<S: Store> Db<S> {
         self.transact(writes)
     }
 
+    /// Insert or replace MANY rows in one byte-keyed table under ONE transaction — every row post-image plus a catalog re-encoded exactly once.
+    /// Row-at-a-time `put_row_in` costs two durable commits AND a whole-catalog re-encode per row, which on a phone is hundreds of milliseconds apiece: a 50-row history page spent 100 commits re-encoding a 700-pk catalog 50 times (field 2026-09-24 — mean vault commit 567ms, 146 of the day's 394 over the 200ms SLOW line, worst 2659ms, every vault caller blocked behind each one).
+    /// Same atomicity as the single-row form: one WAL record, one superroot flip, so the page lands whole or not at all.
+    pub fn put_rows_in(&mut self, table: &[u8], rows: &[(Pk, &Record)]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut writes = Vec::with_capacity(rows.len() + 1);
+        for (pk, rec) in rows {
+            writes.push((
+                Target::Addr(keys::row_addr(table, &pk.addr_bytes())),
+                Some(record::encode(rec)),
+            ));
+        }
+        let mut pks = self.read_catalog_in(table)?;
+        let mut catalog_grew = false;
+        for (pk, _) in rows {
+            if !pks.iter().any(|p| p == pk) {
+                pks.push(pk.clone().into_owned());
+                catalog_grew = true;
+            }
+        }
+        if catalog_grew {
+            writes.push((
+                Target::Addr(keys::catalog_addr(table, 0)),
+                Some(catalog::encode_pks(&pks)),
+            ));
+        }
+        self.transact(writes)
+    }
+
     /// Fetch a row from a byte-keyed table by typed primary key.
     pub fn get_row_in(&self, table: &[u8], pk: Pk) -> Result<Option<Record>> {
         match self.get_addr(&keys::row_addr(table, &pk.addr_bytes()))? {
@@ -158,6 +189,43 @@ mod tests {
 
         assert_eq!(db.list("track").unwrap(), vec!["5vYA1mW9g2Coh1HUFUSmlb"]);
         assert!(db.get_row("track", "nope").unwrap().is_none());
+    }
+
+    /// A batched page lands every row, extends the catalog ONCE, and costs one transaction — the property the row-at-a-time form lacked (field 2026-09-24: two durable commits and a whole-catalog re-encode per row).
+    #[test]
+    fn put_rows_in_lands_the_page_in_one_transaction() {
+        use crate::Pk;
+        let mut db = Db::open(MemoryStore::new()).unwrap();
+        let table = b"conv".as_slice();
+        // A row already on disk, so the batch is a mix of replace and insert — the catalog must not gain a duplicate for the replaced pk.
+        db.put_row_in(table, Pk::bytes(b"k0"), &Record::new().set("n", 0u64))
+            .unwrap();
+        let before = db.seq();
+
+        let recs: Vec<Record> = (0..4u64).map(|n| Record::new().set("n", n)).collect();
+        let keys: Vec<Vec<u8>> = (0..4).map(|i| format!("k{i}").into_bytes()).collect();
+        let rows: Vec<(Pk, &Record)> = keys
+            .iter()
+            .zip(recs.iter())
+            .map(|(k, r)| (Pk::bytes(k), r))
+            .collect();
+        db.put_rows_in(table, &rows).unwrap();
+
+        // ONE transaction for the whole page, however many rows rode it.
+        assert_eq!(db.seq(), before + 1, "a batched page must be one transaction");
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(
+                db.get_row_in(table, Pk::bytes(k)).unwrap().unwrap().uint("n"),
+                Some(i as u64),
+                "row {i} missing or stale after the batch"
+            );
+        }
+        // Four distinct pks, the pre-existing one counted once.
+        let pks = db.list_in(table).unwrap();
+        assert_eq!(pks.len(), 4, "catalog gained a duplicate: {pks:?}");
+        // An empty batch is a no-op, not an empty transaction.
+        db.put_rows_in(table, &[]).unwrap();
+        assert_eq!(db.seq(), before + 1);
     }
 
     #[test]

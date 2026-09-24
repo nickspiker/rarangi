@@ -110,6 +110,12 @@ impl<S: Store> Db<S> {
     }
 
     /// Commit a set of post-images as one atomic logical transaction.
+    /// The committed transaction counter: how many transactions have landed since the store was empty.
+    /// Each transaction is two durable commits, so this is the number a caller watches to prove a batched write costs ONE transaction rather than one per row.
+    pub fn seq(&self) -> u64 {
+        self.committed_seq
+    }
+
     pub fn transact(&mut self, writes: Vec<Write>) -> Result<()> {
         let seq = self.committed_seq + 1;
         let new_superroot = encode_superroot(seq);
