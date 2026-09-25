@@ -115,6 +115,24 @@ impl<S: Store> Db<S> {
         self.transact(writes)
     }
 
+    /// Delete MANY rows from one byte-keyed table under ONE transaction — the batch twin of `delete_row_in`, for the same reason `put_rows_in` exists: per-row deletes cost two durable commits and a whole-catalog re-encode each.
+    pub fn delete_rows_in(&mut self, table: &[u8], pks: &[Pk]) -> Result<()> {
+        if pks.is_empty() {
+            return Ok(());
+        }
+        let mut writes = Vec::with_capacity(pks.len() + 1);
+        for pk in pks {
+            writes.push((Target::Addr(keys::row_addr(table, &pk.addr_bytes())), None));
+        }
+        let mut catalog = self.read_catalog_in(table)?;
+        let before = catalog.len();
+        catalog.retain(|p| !pks.contains(p));
+        if catalog.len() != before {
+            writes.push((Target::Addr(keys::catalog_addr(table, 0)), Some(catalog::encode_pks(&catalog))));
+        }
+        self.transact(writes)
+    }
+
     /// Every typed primary key in a byte-keyed table, in insertion order (read from the typed catalog).
     pub fn list_in(&self, table: &[u8]) -> Result<Vec<Pk<'static>>> {
         self.read_catalog_in(table)
@@ -225,6 +243,25 @@ mod tests {
         assert_eq!(pks.len(), 4, "catalog gained a duplicate: {pks:?}");
         // An empty batch is a no-op, not an empty transaction.
         db.put_rows_in(table, &[]).unwrap();
+        assert_eq!(db.seq(), before + 1);
+    }
+
+    /// A batch delete drops every named row and its catalog entries in one transaction, and leaves the rest alone.
+    #[test]
+    fn delete_rows_in_is_one_transaction() {
+        use crate::Pk;
+        let mut db = Db::open(MemoryStore::new()).unwrap();
+        let table = b"conv".as_slice();
+        for k in [b"a", b"b", b"c"] {
+            db.put_row_in(table, Pk::bytes(k), &Record::new().set("x", 1u64)).unwrap();
+        }
+        let before = db.seq();
+        db.delete_rows_in(table, &[Pk::bytes(b"a"), Pk::bytes(b"c")]).unwrap();
+        assert_eq!(db.seq(), before + 1);
+        assert!(db.get_row_in(table, Pk::bytes(b"a")).unwrap().is_none());
+        assert!(db.get_row_in(table, Pk::bytes(b"b")).unwrap().is_some());
+        assert_eq!(db.list_in(table).unwrap(), vec![Pk::bytes(b"b").into_owned()]);
+        db.delete_rows_in(table, &[]).unwrap();
         assert_eq!(db.seq(), before + 1);
     }
 
