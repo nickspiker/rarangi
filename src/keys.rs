@@ -36,7 +36,7 @@ pub fn row(table: &str, pk: &str) -> String {
 const ROW_CONTEXT: &str = "rarangi.byte-table.row.v0";
 const CATALOG_CONTEXT: &str = "rarangi.byte-table.catalog.v0";
 
-/// The 32-byte vault address for one row in a byte-keyed table: derived from `table_bytes ++ pk_bytes` under the row context. The pk's bytes come from `Pk::addr_bytes()` (a counter's 8 big-endian bytes, a string's/hash's literal bytes), so distinct (table, pk) pairs land on distinct addresses.
+/// The 32-byte vault address for one row in a byte-keyed table: derived from `table_bytes ++ pk_bytes` under the row context. The pk's bytes come from `Pk::addr_bytes()` (a counter's 8 big-endian bytes, a hash's literal bytes, a string's VSF `x` wire form), so distinct (table, pk) pairs land on distinct addresses.
 pub fn row_addr(table: &[u8], pk_bytes: &[u8]) -> [u8; 32] {
     // Length-prefix the table so `(table, pk)` is unambiguous for any byte lengths — without it `("ab", "c")` and `("a", "bc")` would hash identically.
     let mut material = Vec::with_capacity(8 + table.len() + pk_bytes.len());
@@ -52,6 +52,43 @@ pub fn catalog_addr(table: &[u8], shard: u64) -> [u8; 32] {
     material.extend_from_slice(table);
     material.extend_from_slice(&shard.to_be_bytes());
     blake3::derive_key(CATALOG_CONTEXT, &material)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::row_addr;
+    use crate::Pk;
+
+    fn hex(a: &[u8; 32]) -> String {
+        a.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Known-answer pins for the row address: `Int` and `Bytes` are frozen exactly as they were before LIB-14 (values captured from the pre-change code), because moving them would re-address every existing row in every vault.
+    /// The `Str` pin is the post-LIB-14 wire-form address; drift there means the x encoder changed and every text-keyed row moved, which must never happen silently.
+    #[test]
+    fn row_addr_known_answers() {
+        let table = [9u8; 32];
+        let cases: [(Pk, &str); 6] = [
+            (Pk::Int(0), "250a200a5a08075d3239907b3b8b83e20c772cab49df4bc20d67078d157c6480"),
+            (Pk::Int(1), "f4a505d905bdf958c38f11eaaf0963a55436dee06e32910af9eae345d2571d69"),
+            (Pk::Int(5_000_000_000), "2b10d876ce4bc4476ce08fcd0af94bc8abe6ba512b74a6d04b89b4c5cb0161a9"),
+            (Pk::bytes(&[0xABu8; 32]), "95d7c96e8e0abebec9bb3eefc96ee49931aab5a0a6feddf1526515a022cafa67"),
+            (Pk::bytes(b"k0"), "727b8d2dea4a6e70fe40be92df531c9ddb3f417a056f069bc6b80eee0a666db2"),
+            (Pk::str("café"), "d6bd5ba651b6c11e97370ba8c345bb98d0cad61ec2fe1c5984429a5cc598afeb"),
+        ];
+        for (pk, want) in &cases {
+            assert_eq!(&hex(&row_addr(&table, &pk.addr_bytes())), want, "row address drifted for {pk:?}");
+        }
+        // The pre-LIB-14 raw-byte address of "café" is no longer where that row lives.
+        assert_ne!(
+            hex(&row_addr(&table, &Pk::str("café").addr_bytes())),
+            "52e848edabce94524b3741930902122505faa348bb674cfbb947d59177c6a256"
+        );
+        assert_eq!(
+            row_addr(&table, &Pk::str("café").addr_bytes()),
+            row_addr(&table, &Pk::str("cafe\u{301}").addr_bytes())
+        );
+    }
 }
 
 /// A large-media manifest (chunk count, per-chunk hash, total length, mime).

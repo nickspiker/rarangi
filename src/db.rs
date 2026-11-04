@@ -51,13 +51,14 @@ impl<S: Store> Db<S> {
 
     // ======================================================================== Byte-keyed table API ======================================================
     // Same row+catalog-in-one-transaction guarantee as the string API, but the table is raw bytes (a 32-byte friendship id) and the pk is typed (`Pk`): the row address is derived from `table ++ pk.addr_bytes()` and the pk round-trips through the catalog by its native VSF type. No binary is ever text-encoded into a key.
+    // The catalog is searched with `Pk::same_key`, never `==`: a text key is one key however it is spelled (its address is its x wire form, which NFC-folds), so a respelled put adds no duplicate and a respelled delete leaves nothing behind (LIB-14).
 
     /// Insert or replace a row in a byte-keyed table, keeping the table's typed catalog in the same transaction.
     pub fn put_row_in(&mut self, table: &[u8], pk: Pk, rec: &Record) -> Result<()> {
         let row = keys::row_addr(table, &pk.addr_bytes());
         let mut writes = vec![(Target::Addr(row), Some(record::encode(rec)))];
         let mut pks = self.read_catalog_in(table)?;
-        if !pks.iter().any(|p| p == &pk) {
+        if !pks.iter().any(|p| p.same_key(&pk)) {
             pks.push(pk.into_owned());
             writes.push((Target::Addr(keys::catalog_addr(table, 0)), Some(catalog::encode_pks(&pks))));
         }
@@ -81,7 +82,7 @@ impl<S: Store> Db<S> {
         let mut pks = self.read_catalog_in(table)?;
         let mut catalog_grew = false;
         for (pk, _) in rows {
-            if !pks.iter().any(|p| p == pk) {
+            if !pks.iter().any(|p| p.same_key(pk)) {
                 pks.push(pk.clone().into_owned());
                 catalog_grew = true;
             }
@@ -108,7 +109,7 @@ impl<S: Store> Db<S> {
         let row = keys::row_addr(table, &pk.addr_bytes());
         let mut writes = vec![(Target::Addr(row), None)];
         let mut pks = self.read_catalog_in(table)?;
-        if let Some(i) = pks.iter().position(|p| p == &pk) {
+        if let Some(i) = pks.iter().position(|p| p.same_key(&pk)) {
             pks.remove(i);
             writes.push((Target::Addr(keys::catalog_addr(table, 0)), Some(catalog::encode_pks(&pks))));
         }
@@ -126,7 +127,7 @@ impl<S: Store> Db<S> {
         }
         let mut catalog = self.read_catalog_in(table)?;
         let before = catalog.len();
-        catalog.retain(|p| !pks.contains(p));
+        catalog.retain(|p| !pks.iter().any(|d| d.same_key(p)));
         if catalog.len() != before {
             writes.push((Target::Addr(keys::catalog_addr(table, 0)), Some(catalog::encode_pks(&catalog))));
         }
@@ -322,6 +323,43 @@ mod tests {
             vec![Pk::Int(0), Pk::str("alpha"), Pk::bytes(&hash_pk)]
         );
         assert_eq!(db.list_in(&t2).unwrap(), vec![Pk::Int(0)]);
+    }
+
+    /// LIB-14: a composed text key and its decomposed spelling are ONE row and ONE catalog entry, in both the single-row and batch forms.
+    #[test]
+    fn byte_table_str_pk_spellings_are_one_key() {
+        use crate::Pk;
+        let mut db = Db::open(MemoryStore::new()).unwrap();
+        let table = [7u8; 32];
+        let composed = "café";
+        let decomposed = "cafe\u{301}";
+        assert_ne!(composed, decomposed);
+
+        db.put_row_in(&table, Pk::str(composed), &Record::new().set("x", 1u64)).unwrap();
+        db.put_row_in(&table, Pk::str(decomposed), &Record::new().set("x", 2u64)).unwrap();
+        // One catalog entry, and the second put replaced the first row rather than landing beside it.
+        assert_eq!(db.list_in(&table).unwrap().len(), 1, "respelled put grew the catalog");
+        assert_eq!(db.get_row_in(&table, Pk::str(composed)).unwrap().unwrap().uint("x"), Some(2));
+        assert_eq!(db.get_row_in(&table, Pk::str(decomposed)).unwrap().unwrap().uint("x"), Some(2));
+        // The catalog hands back a key that finds the row, whichever spelling was put.
+        let listed = db.list_in(&table).unwrap().remove(0);
+        assert_eq!(db.get_row_in(&table, listed).unwrap().unwrap().uint("x"), Some(2));
+
+        // A batch put under both spellings is still one entry.
+        let r3 = Record::new().set("x", 3u64);
+        db.put_rows_in(&table, &[(Pk::str(composed), &r3), (Pk::str(decomposed), &r3)]).unwrap();
+        assert_eq!(db.list_in(&table).unwrap().len(), 1, "batch put under two spellings grew the catalog");
+
+        // Deleting under the other spelling clears the row and the entry.
+        db.delete_row_in(&table, Pk::str(decomposed)).unwrap();
+        assert!(db.get_row_in(&table, Pk::str(composed)).unwrap().is_none());
+        assert!(db.list_in(&table).unwrap().is_empty(), "respelled delete left the catalog entry behind");
+
+        // And the batch delete twin folds spellings the same way.
+        db.put_row_in(&table, Pk::str(composed), &Record::new().set("x", 4u64)).unwrap();
+        db.delete_rows_in(&table, &[Pk::str(decomposed)]).unwrap();
+        assert!(db.get_row_in(&table, Pk::str(composed)).unwrap().is_none());
+        assert!(db.list_in(&table).unwrap().is_empty(), "batch respelled delete left the catalog entry behind");
     }
 
     #[test]
