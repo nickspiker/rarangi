@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "kete"
-version = "0.0.2"
+version = "0.0.5"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -608,7 +608,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "manifestus"
-version = "0.0.2"
+version = "0.0.5"
 dependencies = [
  "blake3",
  "hashbrown 0.15.5",
@@ -950,7 +950,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tohu"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "base64",
  "blake3",
@@ -1006,7 +1006,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vsf"
-version = "0.9.3"
+version = "0.10.2"
 dependencies = [
  "bitvec",
  "blake3",
