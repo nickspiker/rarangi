@@ -7,50 +7,39 @@ use crate::{blob, catalog, keys};
 use crate::record::{self, Record};
 
 impl<S: Store> Db<S> {
+    // ======================================================================== Text-keyed table API ======================================================
+    // The text API is the byte-keyed API with a text table: the table reaches the address as its VSF x wire form (`keys::text_table`) and the pk as `Pk::Str`, so no raw string bytes are ever hashed and a text key is one row and one catalog entry however it is spelled (LIB-14).
+
     /// Insert or replace a row, keeping the table catalog in the same transaction.
     pub fn put_row(&mut self, table: &str, pk: &str, rec: &Record) -> Result<()> {
-        let mut writes = vec![(Target::Str(keys::row(table, pk)), Some(record::encode(rec)))];
-        let mut pks = self.read_catalog(table)?;
-        if !pks.iter().any(|p| p == pk) {
-            pks.push(pk.to_string());
-            writes.push((Target::Str(keys::catalog(table, 0)), Some(catalog::encode(&pks))));
-        }
-        self.transact(writes)
+        self.put_row_in(&keys::text_table(table), Pk::str(pk), rec)
     }
 
     /// Fetch a row by primary key.
     pub fn get_row(&self, table: &str, pk: &str) -> Result<Option<Record>> {
-        match self.get(&keys::row(table, pk))? {
-            Some(b) => Ok(Some(record::decode(&b)?)),
-            None => Ok(None),
-        }
+        self.get_row_in(&keys::text_table(table), Pk::str(pk))
     }
 
     /// Delete a row, dropping it from the catalog in the same transaction.
     pub fn delete_row(&mut self, table: &str, pk: &str) -> Result<()> {
-        let mut writes = vec![(Target::Str(keys::row(table, pk)), None)];
-        let mut pks = self.read_catalog(table)?;
-        if let Some(i) = pks.iter().position(|p| p == pk) {
-            pks.remove(i);
-            writes.push((Target::Str(keys::catalog(table, 0)), Some(catalog::encode(&pks))));
-        }
-        self.transact(writes)
+        self.delete_row_in(&keys::text_table(table), Pk::str(pk))
     }
 
     /// Every primary key in a table, in insertion order (read from the catalog).
+    /// A text table only ever holds `Pk::Str`, so any other kind means the catalog is not what this API wrote.
     pub fn list(&self, table: &str) -> Result<Vec<String>> {
-        self.read_catalog(table)
-    }
-
-    fn read_catalog(&self, table: &str) -> Result<Vec<String>> {
-        match self.get(&keys::catalog(table, 0))? {
-            Some(b) => catalog::decode(&b),
-            None => Ok(Vec::new()),
+        let mut out = Vec::new();
+        for pk in self.list_in(&keys::text_table(table))? {
+            match pk {
+                Pk::Str(s) => out.push(s.into_owned()),
+                _ => return Err(DbError::Corrupt("text table catalog holds a non-text pk".into())),
+            }
         }
+        Ok(out)
     }
 
     // ======================================================================== Byte-keyed table API ======================================================
-    // Same row+catalog-in-one-transaction guarantee as the string API, but the table is raw bytes (a 32-byte friendship id) and the pk is typed (`Pk`): the row address is derived from `table ++ pk.addr_bytes()` and the pk round-trips through the catalog by its native VSF type. No binary is ever text-encoded into a key.
+    // Same row+catalog-in-one-transaction guarantee as the text API, but the table is raw bytes (a 32-byte friendship id) and the pk is typed (`Pk`): the row address is derived from `table ++ pk.addr_bytes()` and the pk round-trips through the catalog by its native VSF type. No binary is ever text-encoded into a key.
     // The catalog is searched with `Pk::same_key`, never `==`: a text key is one key however it is spelled (its address is its x wire form, which NFC-folds), so a respelled put adds no duplicate and a respelled delete leaves nothing behind (LIB-14).
 
     /// Insert or replace a row in a byte-keyed table, keeping the table's typed catalog in the same transaction.
@@ -264,6 +253,42 @@ mod tests {
         assert_eq!(db.list_in(table).unwrap(), vec![Pk::bytes(b"b").into_owned()]);
         db.delete_rows_in(table, &[]).unwrap();
         assert_eq!(db.seq(), before + 1);
+    }
+
+    /// LIB-14 on the `&str` API: a composed key and its decomposed spelling are one row and one catalog entry, a respelled delete leaves nothing behind, and the table name folds the same way.
+    #[test]
+    fn text_table_spellings_are_one_key() {
+        use crate::{keys, Pk};
+        let mut db = Db::open(MemoryStore::new()).unwrap();
+        let composed = "café";
+        let decomposed = "cafe\u{301}";
+
+        db.put_row("t", composed, &Record::new().set("x", 1u64)).unwrap();
+        db.put_row("t", decomposed, &Record::new().set("x", 2u64)).unwrap();
+        assert_eq!(db.list("t").unwrap(), vec![composed], "a respelled put added a second catalog entry");
+        assert_eq!(db.get_row("t", composed).unwrap().unwrap().uint("x"), Some(2));
+        assert_eq!(db.get_row("t", decomposed).unwrap().unwrap().uint("x"), Some(2));
+
+        // The text API is the byte-keyed API with the table as its x wire form: one row, reachable from either.
+        assert_eq!(db.get_row_in(&keys::text_table("t"), Pk::str(composed)).unwrap().unwrap().uint("x"), Some(2));
+
+        // A table named in either spelling is one table.
+        db.put_row(composed, "k", &Record::new().set("x", 3u64)).unwrap();
+        assert_eq!(db.get_row(decomposed, "k").unwrap().unwrap().uint("x"), Some(3));
+        assert_eq!(db.list(decomposed).unwrap(), vec!["k"]);
+
+        db.delete_row("t", decomposed).unwrap();
+        assert!(db.get_row("t", composed).unwrap().is_none());
+        assert!(db.list("t").unwrap().is_empty(), "a respelled delete left the catalog entry behind");
+    }
+
+    /// The text API refuses a catalog holding a non-text pk instead of returning a key it never wrote.
+    #[test]
+    fn text_table_list_rejects_a_non_text_pk() {
+        use crate::{keys, Pk};
+        let mut db = Db::open(MemoryStore::new()).unwrap();
+        db.put_row_in(&keys::text_table("t"), Pk::Int(0), &Record::new().set("x", 1u64)).unwrap();
+        assert!(db.list("t").is_err());
     }
 
     #[test]

@@ -20,16 +20,6 @@ pub fn catmeta(table: &str) -> String {
     format!("catmeta/{table}")
 }
 
-/// One shard of a table's primary-key catalog (the enumeration substrate).
-pub fn catalog(table: &str, shard: u64) -> String {
-    format!("catalog/{table}/{shard}")
-}
-
-/// One row, by table + primary key.
-pub fn row(table: &str, pk: &str) -> String {
-    format!("row/{table}/{pk}")
-}
-
 // ============================================================================ Byte-native addressing ====================================================
 // A byte-keyed table can't go through the string scheme above (the table is raw bytes — a 32-byte friendship id — and text-encoding binary into keys is exactly what's being removed). Instead rārangi derives the 32-byte vault address directly from the bytes with `blake3::derive_key`, the same primitive kete uses for its own entry addresses, then writes via the `*_addr` Store path. The derive context is domain-separated per logical kind (row vs catalog) so a row and its catalog never collide even for the same table.
 
@@ -52,6 +42,12 @@ pub fn catalog_addr(table: &[u8], shard: u64) -> [u8; 32] {
     material.extend_from_slice(table);
     material.extend_from_slice(&shard.to_be_bytes());
     blake3::derive_key(CATALOG_CONTEXT, &material)
+}
+
+/// The table bytes for a text-named table (the `&str` row API): its VSF `x` wire form, the same encoding a `Pk::Str` contributes to a row address.
+/// Text reaches a hash only through the x encoder (NFC inside), never as raw string bytes, so "café" and "cafe\u{301}" name one table (LIB-14).
+pub fn text_table(table: &str) -> Vec<u8> {
+    vsf::VsfType::x(table.to_string()).flatten()
 }
 
 #[cfg(test)]
@@ -88,6 +84,19 @@ mod tests {
             row_addr(&table, &Pk::str("café").addr_bytes()),
             row_addr(&table, &Pk::str("cafe\u{301}").addr_bytes())
         );
+    }
+
+    /// The `&str` row API's address is the byte-keyed `Str` address with the table as its x wire form: both table and pk NFC-fold, and the pin catches any drift in that composition.
+    #[test]
+    fn text_table_address_is_the_x_wire_form() {
+        use super::{catalog_addr, text_table};
+        assert_eq!(text_table("café"), Pk::str("café").to_vsf().flatten());
+        assert_eq!(text_table("café"), text_table("cafe\u{301}"));
+        assert_ne!(text_table("track"), b"track".to_vec(), "a text table never hashes as its raw bytes");
+        let addr = row_addr(&text_table("track"), &Pk::str("café").addr_bytes());
+        assert_eq!(addr, row_addr(&text_table("track"), &Pk::str("cafe\u{301}").addr_bytes()));
+        assert_eq!(hex(&addr), "f5cc5e1bd1006791518c70fdf5e92cdfddff43700755e552191b11906c010b00");
+        assert_eq!(catalog_addr(&text_table("café"), 0), catalog_addr(&text_table("cafe\u{301}"), 0));
     }
 }
 
