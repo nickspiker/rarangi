@@ -72,7 +72,8 @@ impl<'a> Pk<'a> {
             VsfType::u4(n) => Pk::Int(*n as u64),
             VsfType::u5(n) => Pk::Int(*n as u64),
             VsfType::u6(n) => Pk::Int(*n),
-            VsfType::x(s) | VsfType::a(s) => Pk::Str(Cow::Owned(s.clone())),
+            VsfType::x(s) => Pk::Str(Cow::Owned(s.clone())),
+            VsfType::a(s) => Pk::Str(Cow::Owned(s.to_string())),
             VsfType::t_u3(t) => Pk::Bytes(Cow::Owned(t.data.clone())),
             _ => return Err(DbError::Corrupt("catalog pk has unsupported VSF type".into())),
         })

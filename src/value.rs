@@ -30,7 +30,7 @@ impl Value {
     pub fn from_vsf(v: &VsfType) -> Option<Value> {
         Some(match v {
             VsfType::x(s) => Value::Text(s.clone()),
-            VsfType::a(s) => Value::Text(s.clone()),
+            VsfType::a(s) => Value::Text(s.to_string()),
             VsfType::u3(u) => Value::Uint(*u as u64),
             VsfType::u4(u) => Value::Uint(*u as u64),
             VsfType::u5(u) => Value::Uint(*u as u64),
